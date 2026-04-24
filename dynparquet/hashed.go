@@ -120,6 +120,22 @@ func hashListArray(arr *array.List) (res []uint64) {
 			digest.Reset()
 		}
 		return
+	case *array.Uint64:
+		// Hash the raw 64-bit payload — identical byte-level mapping to
+		// the Int64 case above, because parquet carries unsigned
+		// integers as INT64 two's-complement and the prehash key must
+		// agree with the persisted form.
+		var buf [8]byte
+		for i := 0; i < arr.Len(); i++ {
+			start, end := arr.ValueOffsets(i)
+			for j := start; j < end; j++ {
+				_, _ = digest.Write(binary.BigEndian.AppendUint64(buf[:0],
+					e.Value(int(j))))
+			}
+			res[i] = digest.Sum64()
+			digest.Reset()
+		}
+		return
 	case *array.Float64:
 		var buf [8]byte
 		for i := 0; i < arr.Len(); i++ {
