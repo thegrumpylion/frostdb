@@ -46,7 +46,11 @@ func (t *TableBlock) Persist() error {
 
 		fileName := filepath.Join(t.table.db.name, t.table.name, t.ulid.String(), "data.parquet")
 		if err := sink.Upload(context.Background(), fileName, r); err != nil {
-			return fmt.Errorf("failed to upload block %v", err)
+			// %w (not %v) preserves the sink's error identity so
+			// callers can errors.Is() against their own sentinels —
+			// critical for the Close-surfaces-Upload-error contract
+			// pinned in close_err_prop_test.go.
+			return fmt.Errorf("failed to upload block: %w", err)
 		}
 
 		if err != nil {

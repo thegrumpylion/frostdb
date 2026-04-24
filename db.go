@@ -818,7 +818,14 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 				// tx == nextNonPersistedTxn, we should not persist the active
 				// block, but just create a new block.
 				table.pendingBlocks[table.active] = struct{}{}
-				go table.writeBlock(table.active, tx, db.columnStore.manualBlockRotation)
+				// Fire-and-forget recovery path — DB.Open has no
+				// synchronous caller to surface writeBlock errors
+				// to; existing level.Error logs in writeBlock remain
+				// the only signal. Discard explicitly to make the
+				// lost-error semantics visible.
+				go func() {
+					_ = table.writeBlock(table.active, tx, db.columnStore.manualBlockRotation)
+				}()
 			}
 
 			protoEqual := false
@@ -970,6 +977,13 @@ func (db *DB) Close(options ...CloseOption) error {
 	}
 
 	level.Info(db.logger).Log("msg", "closing DB")
+	// writeErrs collects any writeBlock failures from the shutdown
+	// rotation loop below. These used to be silently logged and
+	// dropped (writeBlock had no error return); surfacing them
+	// through Close's return value is what lets callers detect a
+	// data-loss window on graceful shutdown. See the reproducer in
+	// close_err_prop_test.go.
+	var writeErrs []error
 	for _, table := range db.tables {
 		table.close()
 		if shouldPersist {
@@ -980,13 +994,21 @@ func (db *DB) Close(options ...CloseOption) error {
 			// should be faster to write to local disk than upload to object
 			// storage. This would avoid a slow WAL replay on startup if we
 			// don't manage to persist in time.
-			table.writeBlock(table.ActiveBlock(), db.tx.Load(), false)
+			if err := table.writeBlock(table.ActiveBlock(), db.tx.Load(), false); err != nil {
+				writeErrs = append(writeErrs, fmt.Errorf("table %q: %w", table.name, err))
+			}
 		}
 	}
 	level.Info(db.logger).Log("msg", "closed all tables")
 
 	if err := db.closeInternal(); err != nil {
-		return err
+		// closeInternal's WAL-close error composes with any earlier
+		// writeBlock errors — the caller sees both via errors.Join.
+		writeErrs = append(writeErrs, err)
+		return errors.Join(writeErrs...)
+	}
+	if len(writeErrs) > 0 {
+		return errors.Join(writeErrs...)
 	}
 
 	if (shouldPersist || opts.clearStorage) && db.storagePath != "" {
