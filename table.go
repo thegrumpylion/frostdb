@@ -462,9 +462,21 @@ func (t *Table) dropPendingBlock(block *TableBlock) {
 	}
 }
 
+// writeBlock persists block and records the persistence in the WAL.
+// Returns an error if any step of persist / WAL-log fails; logs
+// retained for backward compatibility with existing observability.
+//
+// Async callers (db.go recovery, table.go RotateBlock) discard the
+// return explicitly via `go func() { _ = t.writeBlock(...) }` since
+// there is nowhere to surface an error to — the caller has already
+// returned. The sync caller (DB.Close at db.go:983) uses the error
+// return so shutdown-rotation failures propagate to
+// ColumnStore.Close. Filed as observer/docs/issues/blockstorage-
+// store-followups.md #3 (pre-fix the error was silently logged and
+// dropped, producing an invisible data-loss window on shutdown).
 func (t *Table) writeBlock(
 	block *TableBlock, nextTxn uint64, snapshotDB bool, opts ...RotateBlockOption,
-) {
+) error {
 	rbo := &rotateBlockOptions{}
 	for _, o := range opts {
 		o(rbo)
@@ -509,7 +521,7 @@ func (t *Table) writeBlock(
 	if err != nil {
 		level.Error(t.logger).Log("msg", "failed to persist block")
 		level.Error(t.logger).Log("msg", err.Error())
-		return
+		return fmt.Errorf("persist block %s: %w", block.ulid, err)
 	}
 
 	if err := func() error {
@@ -543,7 +555,7 @@ func (t *Table) writeBlock(
 
 		return nil
 	}(); err != nil {
-		return
+		return fmt.Errorf("record block persistence in WAL: %w", err)
 	}
 
 	t.mtx.Lock()
@@ -593,6 +605,7 @@ func (t *Table) writeBlock(
 			}
 		}()
 	}
+	return nil
 }
 
 type rotateBlockOptions struct {
@@ -668,7 +681,10 @@ func (t *Table) RotateBlock(_ context.Context, block *TableBlock, opts ...Rotate
 	// We don't check t.db.columnStore.manualBlockRotation here because this is
 	// the entry point for users to trigger a manual block rotation and they
 	// will specify through skipPersist if they want the block to be persisted.
-	go t.writeBlock(block, tx, true, opts...)
+	// Discard writeBlock's error explicitly — this goroutine is fire-and-
+	// forget (RotateBlock has already returned to the caller), so there's
+	// nowhere to surface it beyond writeBlock's existing level.Error logs.
+	go func() { _ = t.writeBlock(block, tx, true, opts...) }()
 
 	return nil
 }
