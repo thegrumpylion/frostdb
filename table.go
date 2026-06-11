@@ -244,6 +244,25 @@ func (t *GenericTable[T]) Write(ctx context.Context, values ...T) (uint64, error
 	return t.InsertRecord(ctx, t.build.NewRecord())
 }
 
+// WriteTx is Write within a transaction: the rows become visible and
+// durable with the transaction's Commit, or never if it aborts, instead of
+// being autocommitted. See Transaction for the transaction contract.
+func (t *GenericTable[T]) WriteTx(ctx context.Context, tx Transaction, values ...T) error {
+	// Resolve the table handle before touching the builder: a failure
+	// here must not leave appended values behind to leak into the next
+	// record built.
+	tbl, err := tx.GetTable(t.name)
+	if err != nil {
+		return err
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.build.Append(values...); err != nil {
+		return err
+	}
+	return tbl.InsertRecord(ctx, t.build.NewRecord())
+}
+
 func NewGenericTable[T any](db *DB, name string, mem memory.Allocator, options ...TableOption) (*GenericTable[T], error) {
 	build := records.NewBuild[T](mem)
 	table, err := db.Table(name, NewTableConfig(build.Schema(name), options...))

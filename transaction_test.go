@@ -518,3 +518,43 @@ func Test_Transaction_DiscardRotationDuringOpenTx(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(3), countRows(t, db, "test"))
 }
+
+// Test_GenericTable_WriteTx pins the typed write path within a
+// transaction: commit makes the rows visible, abort discards them, and a
+// failed GetTable does not pollute the builder for the next write.
+func Test_GenericTable_WriteTx(t *testing.T) {
+	type row struct {
+		Name  string `frostdb:"name,rle_dict"`
+		Value int64  `frostdb:"value"`
+	}
+
+	c, err := New(WithLogger(newTestLogger(t)))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	gt, err := NewGenericTable[row](db, "generic", memory.DefaultAllocator)
+	require.NoError(t, err)
+	defer gt.Release()
+
+	ctx := context.Background()
+
+	tx := db.Begin()
+	require.NoError(t, gt.WriteTx(ctx, tx, row{Name: "a", Value: 1}, row{Name: "b", Value: 2}))
+	require.Equal(t, int64(0), countRows(t, db, "generic"))
+	require.NoError(t, tx.Commit())
+	require.Equal(t, int64(2), countRows(t, db, "generic"))
+
+	tx = db.Begin()
+	require.NoError(t, gt.WriteTx(ctx, tx, row{Name: "c", Value: 3}))
+	tx.Abort()
+	require.Equal(t, int64(2), countRows(t, db, "generic"))
+
+	// A finished transaction rejects the write WITHOUT consuming the
+	// values: the next write must carry exactly its own rows.
+	require.ErrorIs(t, gt.WriteTx(ctx, tx, row{Name: "poison", Value: 9}), ErrTransactionFinished)
+	tx = db.Begin()
+	require.NoError(t, gt.WriteTx(ctx, tx, row{Name: "d", Value: 4}))
+	require.NoError(t, tx.Commit())
+	require.Equal(t, int64(3), countRows(t, db, "generic"))
+}
