@@ -241,15 +241,31 @@ func writeDictionary(def, column, startIdx int, a *array.Dictionary) arrowToParq
 
 func writeList(def, column, startIdx int, a *array.List) (arrowToParquet, error) {
 	var lw arrowToParquet
+	// The explicit cases below match scalar-write helpers one-to-one
+	// (writeInt32/Int64/Uint64/Bool/Float64/String/Binary/Dictionary in
+	// this file) so that a list-of-T round-trips through the same
+	// parquet.Value factory that its scalar-of-T sibling uses.
+	//
+	// The default case is a generic fallback using
+	// parquet.ValueOf(GetOneForMarshal), mirroring writeGeneral for
+	// scalars. This covers the remaining Arrow primitive element
+	// types (uint8/16/32, int8/16, float32, temporal, decimal) that
+	// can be produced by schemapb-constructed schemas.
 	switch e := a.ListValues().(type) {
 	case *array.Int32:
-		// WHile this is not base type. To avoid breaking things I have left it here.
 		lw = writeListOf(def, column, startIdx, a, func(idx int) parquet.Value {
 			return parquet.Int32Value(e.Value(idx))
 		})
 	case *array.Int64:
 		lw = writeListOf(def, column, startIdx, a, func(idx int) parquet.Value {
 			return parquet.Int64Value(e.Value(idx))
+		})
+	case *array.Uint64:
+		// Parquet has no unsigned INT64 physical type; the logical
+		// UINT_64 annotation lives on the schema while the value is
+		// carried as INT64 two's-complement. Matches scalar writeUint64.
+		lw = writeListOf(def, column, startIdx, a, func(idx int) parquet.Value {
+			return parquet.Int64Value(int64(e.Value(idx)))
 		})
 	case *array.Boolean:
 		lw = writeListOf(def, column, startIdx, a, func(idx int) parquet.Value {
@@ -285,7 +301,14 @@ func writeList(def, column, startIdx int, a *array.List) (arrowToParquet, error)
 			return nil, fmt.Errorf("list dictionary not of expected type: %T", d)
 		}
 	default:
-		return nil, fmt.Errorf("list not of expected type: %T", e)
+		// Generic fallback for Arrow primitive types not enumerated
+		// above. parquet.ValueOf dispatches on the Go value type
+		// returned by GetOneForMarshal; the parquet-go library picks
+		// the physical encoding. See writeGeneral for the scalar
+		// equivalent.
+		lw = writeListOf(def, column, startIdx, a, func(idx int) parquet.Value {
+			return parquet.ValueOf(e.GetOneForMarshal(idx))
+		})
 	}
 	return func(w parquet.Row, row int) parquet.Row {
 		if a.IsNull(row + startIdx) {
