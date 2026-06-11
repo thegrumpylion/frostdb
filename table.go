@@ -469,11 +469,11 @@ func (t *Table) dropPendingBlock(block *TableBlock) {
 // Async callers (db.go recovery, table.go RotateBlock) discard the
 // return explicitly via `go func() { _ = t.writeBlock(...) }` since
 // there is nowhere to surface an error to — the caller has already
-// returned. The sync caller (DB.Close at db.go:983) uses the error
+// returned. The sync caller (DB.Close's table walk) uses the error
 // return so shutdown-rotation failures propagate to
-// ColumnStore.Close. Filed as observer/docs/issues/blockstorage-
-// store-followups.md #3 (pre-fix the error was silently logged and
-// dropped, producing an invisible data-loss window on shutdown).
+// ColumnStore.Close — pre-fix the error was silently logged and
+// dropped, an invisible data-loss window on shutdown. Pinned by
+// close_err_prop_test.go (reproducer + WAL-preservation invariant).
 func (t *Table) writeBlock(
 	block *TableBlock, nextTxn uint64, snapshotDB bool, opts ...RotateBlockOption,
 ) error {

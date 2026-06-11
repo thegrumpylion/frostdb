@@ -69,10 +69,12 @@ func TestScalarColumnSurvivesRotateAndReopen(t *testing.T) {
 // then reopens the store and reads the column back. It asserts that
 // the list column values survive the round-trip.
 //
-// Filed as Observer's workaround in
-// docs/issues/frostdb-list-column-rotation-loss.md. The workaround
-// reseeds histograms on every cache hit because bucket_counts reads
-// back EMPTY after rotation. Root cause: pqarrow/parquet.go
+// Historically Observer worked around this by re-seeding its
+// histogram benchmark fixtures on every cache hit, because
+// bucket_counts read back EMPTY after rotation; the workaround was
+// removed once this fix was consumed (Observer's consumption-side
+// regression net: tests/benchmarks/cache_test.go
+// TestHistogramListRoundTripsRotation). Root cause: pqarrow/parquet.go
 // writeList has a type switch over list element types that omits
 // *array.Uint64, returning an error from Serialize; that error
 // unwinds through block.Persist() which deletes the partial upload,
