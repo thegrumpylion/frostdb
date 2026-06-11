@@ -252,3 +252,160 @@ func Test_LSM_InOrderInsert(t *testing.T) {
 		return 0
 	}))
 }
+
+// newRemoveTestLSM builds a 3-level LSM whose watermark is pinned to the
+// given function, for Remove tests.
+func newRemoveTestLSM(t *testing.T, watermark func() uint64) *LSM {
+	t.Helper()
+	lsm, err := NewLSM("test", nil, []*LevelConfig{
+		{Level: L0, MaxSize: 1024 * 1024 * 1024, Type: CompactionTypeParquetMemory, Compact: compactParts},
+		{Level: L1, MaxSize: 1024 * 1024 * 1024, Type: CompactionTypeParquetMemory, Compact: compactParts},
+		{Level: L2, MaxSize: 1024 * 1024 * 1024},
+	}, watermark)
+	require.NoError(t, err)
+	return lsm
+}
+
+// txsInL0 returns the part transaction ids currently linked in the list,
+// front to back.
+func txsInL0(lsm *LSM) []uint64 {
+	txs := []uint64{}
+	lsm.Iterate(func(node *Node) bool {
+		if node.part != nil {
+			txs = append(txs, node.part.TX())
+		}
+		return true
+	})
+	return txs
+}
+
+func Test_LSM_Remove(t *testing.T) {
+	t.Parallel()
+
+	samples := dynparquet.NewTestSamples()
+	r, err := samples.ToRecord()
+	require.NoError(t, err)
+
+	t.Run("adjacent same-tx parts", func(t *testing.T) {
+		lsm := newRemoveTestLSM(t, func() uint64 { return 0 })
+		lsm.Add(1, r)
+		lsm.Add(2, r)
+		lsm.Add(2, r)
+		lsm.Add(2, r)
+		lsm.Add(3, r)
+
+		lsm.Remove(2)
+		require.Equal(t, []uint64{3, 1}, txsInL0(lsm))
+	})
+
+	t.Run("first node match", func(t *testing.T) {
+		lsm := newRemoveTestLSM(t, func() uint64 { return 0 })
+		lsm.Add(1, r)
+		lsm.Add(2, r)
+		// tx 2 sits at the front of the list (descending order).
+		lsm.Remove(2)
+		require.Equal(t, []uint64{1}, txsInL0(lsm))
+	})
+
+	t.Run("remove all parts", func(t *testing.T) {
+		lsm := newRemoveTestLSM(t, func() uint64 { return 0 })
+		lsm.Add(7, r)
+		lsm.Add(7, r)
+		lsm.Remove(7)
+		require.Empty(t, txsInL0(lsm))
+		require.Zero(t, lsm.LevelSize(L0))
+	})
+
+	t.Run("remove nonexistent tx is a no-op", func(t *testing.T) {
+		lsm := newRemoveTestLSM(t, func() uint64 { return 0 })
+		lsm.Add(1, r)
+		size := lsm.LevelSize(L0)
+		lsm.Remove(42)
+		require.Equal(t, []uint64{1}, txsInL0(lsm))
+		require.Equal(t, size, lsm.LevelSize(L0))
+	})
+
+	t.Run("size accounting", func(t *testing.T) {
+		lsm := newRemoveTestLSM(t, func() uint64 { return 0 })
+		lsm.Add(1, r)
+		sizeOne := lsm.LevelSize(L0)
+		lsm.Add(2, r)
+		lsm.Add(2, r)
+		lsm.Remove(2)
+		require.Equal(t, sizeOne, lsm.LevelSize(L0))
+	})
+
+	t.Run("does not cross into compacted levels", func(t *testing.T) {
+		// A part with the same tx below the L0 sentinel must survive:
+		// Remove only scans L0. (Reachable only for completed txns, but
+		// the scan bound is part of the contract.)
+		lsm := newRemoveTestLSM(t, func() uint64 { return math.MaxUint64 })
+		lsm.Add(1, r)
+		lsm.Add(2, r)
+		require.NoError(t, lsm.merge(L0)) // 1 and 2 now live in L1
+		lsm.Add(2, r)                     // a fresh L0 part with tx 2
+		lsm.Remove(2)
+
+		count := 0
+		lsm.Iterate(func(node *Node) bool {
+			if node.part != nil {
+				count++
+			}
+			return true
+		})
+		require.Equal(t, 1, count) // only the compacted L1 part remains
+	})
+
+	t.Run("concurrent add and remove", func(t *testing.T) {
+		lsm := newRemoveTestLSM(t, func() uint64 { return 0 })
+		const iterations = 200
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				lsm.Add(uint64(1000+i), r)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				tx := uint64(2_000_000 + i)
+				lsm.Add(tx, r)
+				lsm.Remove(tx)
+			}
+		}()
+		wg.Wait()
+
+		txs := txsInL0(lsm)
+		require.Len(t, txs, iterations) // every kept part survived
+		for _, tx := range txs {
+			require.Less(t, tx, uint64(2_000_000)) // every removed part is gone
+		}
+	})
+}
+
+// Test_LSM_MergeRespectsWatermark pins the L0 compaction gate: when NO L0
+// part is at or below the watermark, merge must be a no-op. The previous
+// fallback silently compacted the WHOLE L0 list — carrying an open
+// transaction's parts into L1, beyond Remove's reach, resurrecting aborted
+// rows and setting up a double release against a concurrent Remove.
+func Test_LSM_MergeRespectsWatermark(t *testing.T) {
+	t.Parallel()
+
+	samples := dynparquet.NewTestSamples()
+	r, err := samples.ToRecord()
+	require.NoError(t, err)
+
+	lsm := newRemoveTestLSM(t, func() uint64 { return 0 }) // nothing is ever committed
+	lsm.Add(5, r)
+	lsm.Add(6, r)
+	require.NoError(t, lsm.merge(L0))
+
+	require.Equal(t, []uint64{6, 5}, txsInL0(lsm)) // still in L0, uncompacted
+	require.Zero(t, lsm.LevelSize(L1))
+
+	// And Remove can still reach them, as the abort path requires.
+	lsm.Remove(5)
+	require.Equal(t, []uint64{6}, txsInL0(lsm))
+}

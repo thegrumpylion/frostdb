@@ -315,6 +315,16 @@ type TableBlock struct {
 	// snapshot was last triggered.
 	lastSnapshotSize atomic.Int64
 
+	// maxTx is the highest transaction id inserted into this block via
+	// InsertRecord. Block persistence waits for the watermark to reach it
+	// (see writeBlock): an open transaction's parts must never be
+	// persisted, because Abort removes them from the in-memory index only.
+	// Recovery's InsertPart path bypasses this on purpose — every replayed
+	// transaction is finished by construction (TransactionWrite entries
+	// exist only for commits), so the gate is vacuous there. A future LIVE
+	// write path that bypasses InsertRecord would silently skip the gate.
+	maxTx atomic.Uint64
+
 	index *index.LSM
 
 	pendingWritersWg sync.WaitGroup
@@ -450,7 +460,28 @@ func (t *Table) writeBlock(
 
 	level.Debug(t.logger).Log("msg", "done syncing block", "next_txn", nextTxn, "ulid", block.ulid, "size", block.index.Size())
 
-	// Persist the block
+	// Wait for the watermark to cover every transaction that inserted into
+	// this block. pendingWritersWg above only proves the insert CALLS
+	// returned, not that their transactions completed: an open transaction
+	// (db.Begin) may still abort, and Abort removes its parts from the
+	// in-memory index only — once rows reach parquet they are unreachable
+	// to it. Abort removes parts BEFORE releasing its watermark slot, so
+	// when the watermark passes block.maxTx, every part still in this
+	// block's index belongs to a committed transaction. The gate also
+	// covers the skipPersist (discard) path: dropPendingBlock below
+	// releases the index's parts, and an abort racing past that point
+	// would release the transaction's parts a second time — holding the
+	// drop until the transaction finishes closes that window (a finished
+	// transaction's Abort is a no-op).
+	t.db.Wait(block.maxTx.Load())
+
+	// Persist the block. The size check runs after the gate: aborts may
+	// have emptied the block, and an empty block must not be persisted.
+	// Falling through WITHOUT persisting is sound even though a
+	// TableBlockPersisted entry is then logged for it: size==0 here means
+	// every part belonged to aborted transactions, which logged only
+	// TransactionAborted entries — no WAL write at or below NextTx for
+	// this table carries data that replay would need from this block.
 	var err error
 	if !rbo.skipPersist && block.index.Size() != 0 {
 		err = block.Persist()
@@ -1044,6 +1075,12 @@ func (t *TableBlock) InsertRecord(_ context.Context, tx uint64, record arrow.Rec
 	}
 
 	t.index.Add(tx, record)
+	for {
+		cur := t.maxTx.Load()
+		if tx <= cur || t.maxTx.CompareAndSwap(cur, tx) {
+			break
+		}
+	}
 	t.table.metrics.numParts.Inc()
 	t.uncompressedInsertsSize.Add(recordSize)
 	return nil

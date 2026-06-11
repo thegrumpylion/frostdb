@@ -40,6 +40,16 @@ const (
 // calling the levels Compact function and is then added as a new part to the next level.
 //
 // [L0]->[record]->[record]->[L1]->[record/parquet]->[record/parquet] etc.
+//
+// Lock discipline for the part list: Remove is the only operation that
+// unlinks nodes from the front (above-watermark) region of the list, and
+// it holds the exclusive lock. Every other mutation — Add/InsertPart's
+// ordered insert and merge's pointer swap — is CAS-based and holds the
+// shared lock, so it can never publish through a node that Remove is
+// concurrently unlinking. Traversals either hold the shared lock
+// (Iterate) or are safe without it (Snapshot, Rotate): an unlinked node
+// still points into the live list, and removal is watermark-gated so
+// those paths never dereference a removed part's buffers.
 type LSM struct {
 	sync.RWMutex
 	compacting   sync.Mutex
@@ -332,7 +342,12 @@ func (l *LSM) MaxLevel() SentinelType {
 func (l *LSM) Add(tx uint64, record arrow.Record) {
 	record.Retain()
 	size := util.TotalRecordSize(record)
-	l.partList.Insert(parts.NewArrowPart(tx, record, uint64(size), l.schema, parts.WithCompactionLevel(int(L0))))
+	part := parts.NewArrowPart(tx, record, uint64(size), l.schema, parts.WithCompactionLevel(int(L0)))
+	// Shared lock per the list's lock discipline: the CAS insert must not
+	// publish through a node Remove is concurrently unlinking.
+	l.RLock()
+	l.partList.Insert(part)
+	l.RUnlock()
 	l0 := l.sizes[L0].Add(int64(size))
 	l.metrics.LevelSize.WithLabelValues(L0.String()).Set(float64(l0))
 	if l0 >= l.levels[L0].MaxSize() {
@@ -349,6 +364,53 @@ func (l *LSM) Add(tx uint64, record arrow.Record) {
 
 func (l *LSM) WaitForPendingCompactions() {
 	l.compactionWg.Wait()
+}
+
+// Remove unlinks and releases every part with the given transaction id.
+// It is used to abort an uncommitted transaction.
+//
+// Only L0 is scanned: an open transaction's id is above the watermark
+// (the watermark advances strictly through completed transactions), and
+// both compaction into lower levels and block persistence are
+// watermark-gated, so the transaction's parts can only live in L0.
+//
+// Remove holds the exclusive lock per the list's lock discipline; see the
+// LSM doc comment. Released parts stay linked forward so concurrent
+// lock-free traversals (Snapshot) still terminate; they skip the removed
+// parts by their above-watermark tx id and never touch the released
+// buffers.
+func (l *LSM) Remove(tx uint64) {
+	l.Lock()
+	defer l.Unlock()
+
+	var removed int64
+	prev := l.partList
+	node := prev.next.Load()
+	for node != nil {
+		if node.part == nil {
+			// First sentinel below L0: parts of an open transaction
+			// cannot have been compacted past it.
+			break
+		}
+		if node.part.TX() == tx {
+			next := node.next.Load()
+			prev.next.Store(next)
+			removed += node.part.Size()
+			node.part.Release()
+			// prev is unchanged: it is the last live node and now points
+			// at next, which is examined in the next iteration (adjacent
+			// parts of the same transaction are the common case).
+			node = next
+			continue
+		}
+		prev = node
+		node = node.next.Load()
+	}
+
+	if removed != 0 {
+		size := l.sizes[L0].Add(-removed)
+		l.metrics.LevelSize.WithLabelValues(L0.String()).Set(float64(size))
+	}
 }
 
 // InsertPart inserts a part into the LSM tree. It will be inserted into the correct level. It does not check if the insert should cause a compaction.
@@ -373,7 +435,9 @@ func (l *LSM) InsertPart(part parts.Part) {
 	}
 
 	// Insert the part into the correct level, but do not do this if parts with newer TXs have already been inserted.
+	l.RLock()
 	l.findLevel(level).Insert(part)
+	l.RUnlock()
 	size := l.sizes[level].Add(int64(part.Size()))
 	l.metrics.LevelSize.WithLabelValues(level.String()).Set(float64(size))
 }
@@ -495,8 +559,10 @@ func (l *LSM) findNode(node *Node) *Node {
 	return list
 }
 
-// EnsureCompaction forces a compaction of all levels, regardless of whether the
-// levels are below the target size.
+// EnsureCompaction forces a compaction of all levels, regardless of whether
+// the levels are below the target size. L0 parts above the watermark are
+// still excluded: an incomplete transaction may yet abort and remove them,
+// and removal only reaches L0.
 func (l *LSM) EnsureCompaction() error {
 	l.compacting.Lock()
 	defer l.compacting.Unlock()
@@ -550,16 +616,26 @@ func (l *LSM) merge(level SentinelType) error {
 
 		// Find the first part that is <= the watermark and reset the compact list to that part.
 		wm := l.watermark()
+		found := false
 		compact.Iterate(func(node *Node) bool {
-			if node.part == nil && node.sentinel != L0 {
-				return false
+			if node.part == nil {
+				return node.sentinel == L0
 			}
 			if node.part.TX() <= wm {
 				compact = node
+				found = true
 				return false
 			}
 			return true
 		})
+		if !found {
+			// Every L0 part is above the watermark: an incomplete
+			// transaction may still abort and remove its parts, and
+			// Remove only reaches L0. Compacting here would carry such
+			// parts into L1 beyond Abort's reach (and a concurrent
+			// Remove would double-release them). Nothing is eligible.
+			return nil
+		}
 	}
 
 	nodeList := []*Node{}
@@ -625,11 +701,17 @@ func (l *LSM) merge(level SentinelType) error {
 
 	// Replace the compacted list with the new list
 	// find the node that points to the first node in our compacted list.
+	// Shared lock per the list's lock discipline: the node pointing at the
+	// compacted range may itself be an above-watermark part that Remove is
+	// concurrently unlinking; without the lock the swap could publish the
+	// compacted list through the dead node and lose it.
+	l.RLock()
 	node = l.findNode(nodeList[0])
 	for !node.next.CompareAndSwap(nodeList[0], s) {
 		// This can happen at most once in the scenario where a new part is added to the L0 list while we are trying to replace it.
 		node = l.findNode(nodeList[0])
 	}
+	l.RUnlock()
 	l.sizes[level].Add(-int64(size))
 	l.metrics.LevelSize.WithLabelValues(level.String()).Set(float64(l.sizes[level].Load()))
 

@@ -845,42 +845,22 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 				return err
 			}
 		case *walpb.Entry_Write_:
-			entry := e.Write
-			tableName := entry.TableName
-			if lastPersistedTx, ok := persistedTables[tableName]; ok && tx < lastPersistedTx {
-				// This write has already been successfully persisted, so we can
-				// skip it.
-				return nil
-			}
-
-			table, err := db.GetTable(tableName)
-			var tableErr ErrTableNotFound
-			if errors.As(err, &tableErr) {
-				// This means the WAL was truncated at a point where this write
-				// was already successfully persisted to disk in more optimized
-				// form than the WAL.
-				return nil
-			}
-			if err != nil {
-				return fmt.Errorf("get table: %w", err)
-			}
-
-			switch e.Write.Arrow {
-			case true:
-				reader, err := ipc.NewReader(bytes.NewReader(entry.Data))
-				if err != nil {
-					return fmt.Errorf("create ipc reader: %w", err)
+			return db.replayWrite(tx, e.Write, persistedTables)
+		case *walpb.Entry_TransactionWrite_:
+			// A transaction's writes were logged as one atomic entry at
+			// commit, all sharing the entry's tx; each table write replays
+			// exactly like a standalone write entry. Entries for
+			// uncommitted transactions don't exist, so nothing partial can
+			// resurrect here.
+			for _, write := range e.TransactionWrite.Writes {
+				if err := db.replayWrite(tx, write, persistedTables); err != nil {
+					return err
 				}
-				record, err := reader.Read()
-				if err != nil {
-					return fmt.Errorf("read record: %w", err)
-				}
-				defer reader.Release()
-				size := util.TotalRecordSize(record)
-				table.active.index.InsertPart(parts.NewArrowPart(tx, record, uint64(size), table.schema, parts.WithCompactionLevel(int(index.L0))))
-			default:
-				panic("parquet writes are deprecated")
 			}
+			return nil
+		case *walpb.Entry_TransactionAborted_:
+			// The entry only fills the transaction's WAL slot; there is
+			// nothing to replay.
 			return nil
 		case *walpb.Entry_TableBlockPersisted_:
 			// If a block was persisted but the entry still exists in the WAL,
@@ -934,6 +914,46 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 			snapshotLogArgs...,
 		)...,
 	)
+	return nil
+}
+
+// replayWrite re-inserts one WAL table write during recovery, honoring the
+// per-table persisted-transaction horizon. Standalone Write entries and the
+// table writes inside a TransactionWrite entry replay identically.
+func (db *DB) replayWrite(tx uint64, entry *walpb.Entry_Write, persistedTables map[string]uint64) error {
+	tableName := entry.TableName
+	if lastPersistedTx, ok := persistedTables[tableName]; ok && tx < lastPersistedTx {
+		// This write has already been successfully persisted, so we can
+		// skip it.
+		return nil
+	}
+
+	table, err := db.GetTable(tableName)
+	var tableErr ErrTableNotFound
+	if errors.As(err, &tableErr) {
+		// This means the WAL was truncated at a point where this write
+		// was already successfully persisted to disk in more optimized
+		// form than the WAL.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get table: %w", err)
+	}
+
+	if !entry.Arrow {
+		panic("parquet writes are deprecated")
+	}
+	reader, err := ipc.NewReader(bytes.NewReader(entry.Data))
+	if err != nil {
+		return fmt.Errorf("create ipc reader: %w", err)
+	}
+	defer reader.Release()
+	record, err := reader.Read()
+	if err != nil {
+		return fmt.Errorf("read record: %w", err)
+	}
+	size := util.TotalRecordSize(record)
+	table.active.index.InsertPart(parts.NewArrowPart(tx, record, uint64(size), table.schema, parts.WithCompactionLevel(int(index.L0))))
 	return nil
 }
 

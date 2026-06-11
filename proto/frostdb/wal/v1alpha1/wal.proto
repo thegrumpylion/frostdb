@@ -55,6 +55,22 @@ message Entry {
     uint64 tx = 1;
   }
 
+  // The transaction-write entry. It carries every write of a multi-table
+  // transaction in one WAL entry, logged at commit time, so the
+  // transaction is atomically durable: either the whole entry is in the
+  // WAL or none of it is. An uncommitted transaction logs nothing, so a
+  // crash before commit cannot resurrect partial writes on replay.
+  message TransactionWrite {
+    // The writes of the transaction, in insertion order.
+    repeated Write writes = 1;
+  }
+
+  // The transaction-aborted entry. An aborted transaction logs this in
+  // place of a TransactionWrite: the WAL queue requires exactly one entry
+  // per allocated transaction id to make progress, so the transaction's
+  // slot must be filled even though there is nothing to replay.
+  message TransactionAborted {}
+
   // The new-table entry.
   oneof entry_type {
     // Write is set if the entry describes a write.
@@ -65,5 +81,9 @@ message Entry {
     TableBlockPersisted table_block_persisted = 3;
     // Snapshot is set if the entry describes a snapshot.
     Snapshot snapshot = 4;
+    // TransactionWrite is set if the entry describes a transaction-write.
+    TransactionWrite transaction_write = 5;
+    // TransactionAborted is set if the entry describes a transaction-aborted.
+    TransactionAborted transaction_aborted = 6;
   }
 }
