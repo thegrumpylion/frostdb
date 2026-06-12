@@ -178,16 +178,20 @@ func BinaryScalarOperation(left parquet.ColumnChunk, right parquet.Value, operat
 }
 
 // Min returns the minimum value found in the column chunk across all pages.
+// Returns the null value if no page has a non-null minimum (all pages null,
+// or an index with no pages).
 func Min(columnIndex parquet.ColumnIndex) parquet.Value {
-	minV := columnIndex.MinValue(0)
-	for i := 1; i < columnIndex.NumPages(); i++ {
+	minV := parquet.ValueOf(nil)
+	for i := 0; i < columnIndex.NumPages(); i++ {
 		v := columnIndex.MinValue(i)
-		if minV.IsNull() {
-			minV = v
+		if v.IsNull() {
+			// All-null page: it bounds no values, so it must not
+			// participate in the comparison. Feeding the null Value to
+			// compare would treat it as ""/0/false and clobber the
+			// accumulated min, discarding bounds from earlier pages.
 			continue
 		}
-
-		if compare(minV, v) == 1 {
+		if minV.IsNull() || compare(v, minV) < 0 {
 			minV = v
 		}
 	}
@@ -204,16 +208,17 @@ func NullCount(columnIndex parquet.ColumnIndex) int64 {
 }
 
 // Max returns the maximum value found in the column chunk across all pages.
+// Returns the null value if no page has a non-null maximum (all pages null,
+// or an index with no pages).
 func Max(columnIndex parquet.ColumnIndex) parquet.Value {
-	maxValue := columnIndex.MaxValue(0)
-	for i := 1; i < columnIndex.NumPages(); i++ {
+	maxValue := parquet.ValueOf(nil)
+	for i := 0; i < columnIndex.NumPages(); i++ {
 		v := columnIndex.MaxValue(i)
-		if maxValue.IsNull() {
-			maxValue = v
+		if v.IsNull() {
+			// All-null page: see Min.
 			continue
 		}
-
-		if compare(maxValue, v) == -1 {
+		if maxValue.IsNull() || compare(v, maxValue) > 0 {
 			maxValue = v
 		}
 	}
