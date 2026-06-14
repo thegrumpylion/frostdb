@@ -171,12 +171,25 @@ func Test_LSM_Compaction(t *testing.T) {
 
 func Test_LSM_CascadeCompaction(t *testing.T) {
 	t.Parallel()
+	// Level sizes are calibrated to the parquet-serialized size of the test
+	// data so the cascade is exercised deterministically (compaction fires at
+	// size >= MaxSize). Under parquet-go v0.30 one record is a 2748 B file,
+	// and two records merged into a single 6-row file is 2796 B — they differ
+	// by only ~48 B because per-file metadata dominates this tiny data. So:
+	//   - L0 (257) < one record: Add always compacts L0 -> L1.
+	//   - L1..L4 (2772) sits in (2748, 2796]: a single record STAYS at L1,
+	//     but the merged file CASCADES on through to the terminal level (after
+	//     the second Add, L1 holds two separate parts = 5496 B, well over the
+	//     limit, and the merged file at each lower level stays over it too).
+	// These numbers track the parquet encoding's per-file size; a parquet-go
+	// bump that moves it requires re-measuring (v0.24 -> v0.30 moved the
+	// one-record file 2281 -> 2748). The window is narrow by construction.
 	lsm, err := NewLSM("test", nil, []*LevelConfig{
 		{Level: L0, MaxSize: 257, Type: CompactionTypeParquetMemory, Compact: compactParts},
-		{Level: L1, MaxSize: 2281, Type: CompactionTypeParquetMemory, Compact: compactParts},
-		{Level: L2, MaxSize: 2281, Type: CompactionTypeParquetMemory, Compact: compactParts},
-		{Level: 3, MaxSize: 2281, Type: CompactionTypeParquetMemory, Compact: compactParts},
-		{Level: 4, MaxSize: 2281},
+		{Level: L1, MaxSize: 2772, Type: CompactionTypeParquetMemory, Compact: compactParts},
+		{Level: L2, MaxSize: 2772, Type: CompactionTypeParquetMemory, Compact: compactParts},
+		{Level: 3, MaxSize: 2772, Type: CompactionTypeParquetMemory, Compact: compactParts},
+		{Level: 4, MaxSize: 2772},
 	},
 		func() uint64 { return math.MaxUint64 },
 	)

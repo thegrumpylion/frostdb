@@ -135,7 +135,11 @@ func maxRow(buf *dynparquet.SerializedBuffer) (*dynparquet.DynamicRow, error) {
 		return nil, fmt.Errorf("seek to last row of part: %w", err)
 	}
 
-	if n, err := reader.ReadRows(rowBuf); err != nil {
+	// ReadRows returns io.EOF together with the final row(s) (the
+	// io.Reader convention; parquet-go >= v0.30). Seeking to the last row
+	// makes that row the final one, so a successful read reports (1, EOF);
+	// tolerate EOF here exactly as the loop-based readers do (pqarrow).
+	if n, err := reader.ReadRows(rowBuf); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("read last row of part: %w", err)
 	} else if n != 1 {
 		return nil, fmt.Errorf("expected to read exactly 1 row, but read %d", n)
@@ -151,7 +155,9 @@ func minRow(buf *dynparquet.SerializedBuffer) (*dynparquet.DynamicRow, error) {
 	reader := buf.DynamicRowGroup(0).DynamicRows()
 	defer reader.Close()
 
-	if n, err := reader.ReadRows(rowBuf); err != nil {
+	// A single-row row group yields (1, io.EOF) under parquet-go >= v0.30
+	// (EOF accompanies the final row); tolerate EOF as the loop readers do.
+	if n, err := reader.ReadRows(rowBuf); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("read first row of part: %w", err)
 	} else if n != 1 {
 		return nil, fmt.Errorf("expected to read exactly 1 row, but read %d", n)

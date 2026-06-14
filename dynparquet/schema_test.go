@@ -14,6 +14,21 @@ import (
 	schemapb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/schema/v1alpha1"
 )
 
+// readRowsNoEOF reads rows like parquet.Rows.ReadRows but treats the io.EOF
+// that parquet-go (>= v0.30) returns ALONGSIDE the final row(s) as success:
+// a single-shot read of the last row reports (1, io.EOF), where pre-v0.30 it
+// reported (1, nil). Tests that read an exact, known row count use this so
+// the changed read-termination convention does not fail a successful read.
+// A genuinely empty read still returns (0, nil), so "expect N rows"
+// assertions on n remain meaningful.
+func readRowsNoEOF(rows parquet.Rows, buf []parquet.Row) (int, error) {
+	n, err := rows.ReadRows(buf)
+	if err == io.EOF {
+		err = nil
+	}
+	return n, err
+}
+
 func TestMergeRowBatches(t *testing.T) {
 	schema := NewSampleSchema()
 	samples := NewTestSamples()
@@ -45,19 +60,19 @@ func TestMergeRowBatches(t *testing.T) {
 	// Check that the first label column has the exected values.
 	rowBuf := make([]parquet.Row, 1)
 	rows := buf.Rows()
-	n, err := rows.ReadRows(rowBuf)
+	n, err := readRowsNoEOF(rows, rowBuf)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 	row := rowBuf[0]
 	require.Equal(t, "test3", string(row[3].ByteArray()))
 
-	n, err = rows.ReadRows(rowBuf)
+	n, err = readRowsNoEOF(rows, rowBuf)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 	row = rowBuf[0]
 	require.True(t, row[3].IsNull())
 
-	n, err = rows.ReadRows(rowBuf)
+	n, err = readRowsNoEOF(rows, rowBuf)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 	row = rowBuf[0]
@@ -208,11 +223,14 @@ func TestMultipleIterations(t *testing.T) {
 	i := 0
 	for {
 		n, err := rows.ReadRows(rowBuf)
+		// Count the batch BEFORE the EOF check: parquet-go (>= v0.30) returns
+		// io.EOF together with the final row(s), so breaking first would drop
+		// the last batch (the count would be short by one).
+		i += n
 		if err == io.EOF {
 			break
 		}
 		require.NoError(t, err)
-		i += n
 	}
 	require.Equal(t, 3, i)
 	require.NoError(t, rows.Close())
@@ -221,11 +239,14 @@ func TestMultipleIterations(t *testing.T) {
 	i = 0
 	for {
 		n, err := rows.ReadRows(rowBuf)
+		// Count the batch BEFORE the EOF check: parquet-go (>= v0.30) returns
+		// io.EOF together with the final row(s), so breaking first would drop
+		// the last batch (the count would be short by one).
+		i += n
 		if err == io.EOF {
 			break
 		}
 		require.NoError(t, err)
-		i += n
 	}
 	require.Equal(t, 3, i)
 	require.NoError(t, rows.Close())

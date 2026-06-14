@@ -113,7 +113,7 @@ func TestLess(t *testing.T) {
 		Rows:           make([]parquet.Row, 1),
 		fields:         rowGroups[0].Schema().Fields(),
 	}
-	n, err := rowGroups[0].Rows().ReadRows(row1.Rows)
+	n, err := readRowsNoEOF(rowGroups[0].Rows(), row1.Rows)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 
@@ -123,7 +123,7 @@ func TestLess(t *testing.T) {
 		Rows:           make([]parquet.Row, 1),
 		fields:         rowGroups[1].Schema().Fields(),
 	}
-	n, err = rowGroups[1].Rows().ReadRows(row2.Rows)
+	n, err = readRowsNoEOF(rowGroups[1].Rows(), row2.Rows)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 
@@ -133,7 +133,7 @@ func TestLess(t *testing.T) {
 		Rows:           make([]parquet.Row, 1),
 		fields:         rowGroups[2].Schema().Fields(),
 	}
-	n, err = rowGroups[2].Rows().ReadRows(row3.Rows)
+	n, err = readRowsNoEOF(rowGroups[2].Rows(), row3.Rows)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 
@@ -169,7 +169,7 @@ func TestLess(t *testing.T) {
 			Rows:           make([]parquet.Row, 1),
 			fields:         rg.Schema().Fields(),
 		}
-		n, err = rg.Rows().ReadRows(row4.Rows)
+		n, err = readRowsNoEOF(rg.Rows(), row4.Rows)
 		require.NoError(t, err)
 		require.Equal(t, 1, n)
 		require.True(t, schema.RowLessThan(row1.Get(0), row4.Get(0)))
@@ -203,7 +203,7 @@ func TestLess(t *testing.T) {
 			Rows:           make([]parquet.Row, 1),
 			fields:         rg.Schema().Fields(),
 		}
-		n, err := rg.Rows().ReadRows(row1.Rows)
+		n, err := readRowsNoEOF(rg.Rows(), row1.Rows)
 		require.NoError(t, err)
 		require.Equal(t, 1, n)
 
@@ -217,7 +217,7 @@ func TestLess(t *testing.T) {
 			Rows:           make([]parquet.Row, 1),
 			fields:         rg.Schema().Fields(),
 		}
-		n, err = rg.Rows().ReadRows(row2.Rows)
+		n, err = readRowsNoEOF(rg.Rows(), row2.Rows)
 		require.NoError(t, err)
 		require.Equal(t, 1, n)
 
@@ -264,7 +264,7 @@ func TestLessWithDynamicSchemas(t *testing.T) {
 		Rows:           make([]parquet.Row, 1),
 		fields:         rowGroups[0].Schema().Fields(),
 	}
-	n, err := rowGroups[0].Rows().ReadRows(row1.Rows)
+	n, err := readRowsNoEOF(rowGroups[0].Rows(), row1.Rows)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 
@@ -274,7 +274,7 @@ func TestLessWithDynamicSchemas(t *testing.T) {
 		Rows:           make([]parquet.Row, 1),
 		fields:         rowGroups[1].Schema().Fields(),
 	}
-	n, err = rowGroups[1].Rows().ReadRows(row2.Rows)
+	n, err = readRowsNoEOF(rowGroups[1].Rows(), row2.Rows)
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 
