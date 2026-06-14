@@ -682,7 +682,7 @@ func Test_RowWriter(t *testing.T) {
 	}, false)
 	defer table.schema.PutWriter(pw)
 	require.NoError(t, err)
-	rowWriter, err := table.ActiveBlock().rowWriter(pw)
+	rowWriter, err := table.rowWriter(pw)
 	require.NoError(t, err)
 
 	// Write 17(8,9) rows, expect 3 row groups of 5 rows and 1 row group of 2 rows

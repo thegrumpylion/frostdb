@@ -1159,16 +1159,25 @@ type parquetRowWriterOption func(p *parquetRowWriter)
 
 // rowWriter returns a new Parquet row writer with the given dynamic columns.
 // TODO(asubiotto): Can we delete this parquetRowWriter?
-func (t *TableBlock) rowWriter(w ParquetWriter, options ...parquetRowWriterOption) (*parquetRowWriter, error) {
+//
+// This is a Table-level operation: it derives the writer solely from the
+// table's config (atomic) and schema (immutable), using no per-block
+// state. It was previously a *TableBlock method, which forced callers in
+// the compaction path (compactParts, off the async block-persist
+// goroutine) to read t.active to reach the table — an unsynchronized read
+// that raced RotateBlock's t.active write (table.go:443, under t.mtx).
+// Hanging it off *Table removes that read entirely: the race is
+// unrepresentable, not merely guarded.
+func (t *Table) rowWriter(w ParquetWriter, options ...parquetRowWriterOption) (*parquetRowWriter, error) {
 	buffSize := 256
-	config := t.table.config.Load()
+	config := t.config.Load()
 	if config.RowGroupSize > 0 {
 		buffSize = int(config.RowGroupSize)
 	}
 
 	p := &parquetRowWriter{
 		w:            w,
-		schema:       t.table.schema,
+		schema:       t.schema,
 		rowsBuf:      make([]parquet.Row, buffSize),
 		rowGroupSize: int(config.RowGroupSize),
 	}
@@ -1392,7 +1401,7 @@ func (t *Table) compactParts(w io.Writer, compact []parts.Part, options ...parqu
 			defer t.schema.PutWriter(pw)
 			writer = pw.ParquetWriter
 		}
-		p, err := t.active.rowWriter(writer)
+		p, err := t.rowWriter(writer)
 		if err != nil {
 			return err
 		}
