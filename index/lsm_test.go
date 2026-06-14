@@ -169,34 +169,83 @@ func Test_LSM_Compaction(t *testing.T) {
 	}, 30*time.Second, 10*time.Millisecond)
 }
 
+// probeSettledLevelSize builds a throwaway LSM with the given levels, applies
+// `adds` copies of r, waits for compaction to come to rest with `lvl` as the
+// lowest non-empty level, and returns that level's byte size. The cascade test
+// uses it to DERIVE its thresholds from the live parquet encoding instead of
+// hardcoding byte sizes — a per-file size that drifts across parquet-go
+// versions (v0.24 -> v0.30 moved a one-record file 2281 -> 2748 B and silently
+// broke the old hardcoded thresholds).
+func probeSettledLevelSize(t *testing.T, r arrow.Record, adds int, lvl SentinelType, levels []*LevelConfig) int64 {
+	t.Helper()
+	lsm, err := NewLSM("probe", nil, levels, func() uint64 { return math.MaxUint64 })
+	require.NoError(t, err)
+	for i := 0; i < adds; i++ {
+		lsm.Add(uint64(i+1), r)
+	}
+	require.Eventually(t, func() bool {
+		if lsm.sizes[lvl].Load() == 0 {
+			return false
+		}
+		for i := L0; i < lvl; i++ {
+			if lsm.sizes[i].Load() != 0 {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 10*time.Millisecond)
+	return lsm.sizes[lvl].Load()
+}
+
 func Test_LSM_CascadeCompaction(t *testing.T) {
 	t.Parallel()
-	// Level sizes are calibrated to the parquet-serialized size of the test
-	// data so the cascade is exercised deterministically (compaction fires at
-	// size >= MaxSize). Under parquet-go v0.30 one record is a 2748 B file,
-	// and two records merged into a single 6-row file is 2796 B — they differ
-	// by only ~48 B because per-file metadata dominates this tiny data. So:
-	//   - L0 (257) < one record: Add always compacts L0 -> L1.
-	//   - L1..L4 (2772) sits in (2748, 2796]: a single record STAYS at L1,
-	//     but the merged file CASCADES on through to the terminal level (after
-	//     the second Add, L1 holds two separate parts = 5496 B, well over the
-	//     limit, and the merged file at each lower level stays over it too).
-	// These numbers track the parquet encoding's per-file size; a parquet-go
-	// bump that moves it requires re-measuring (v0.24 -> v0.30 moved the
-	// one-record file 2281 -> 2748). The window is narrow by construction.
-	lsm, err := NewLSM("test", nil, []*LevelConfig{
-		{Level: L0, MaxSize: 257, Type: CompactionTypeParquetMemory, Compact: compactParts},
-		{Level: L1, MaxSize: 2772, Type: CompactionTypeParquetMemory, Compact: compactParts},
-		{Level: L2, MaxSize: 2772, Type: CompactionTypeParquetMemory, Compact: compactParts},
-		{Level: 3, MaxSize: 2772, Type: CompactionTypeParquetMemory, Compact: compactParts},
-		{Level: 4, MaxSize: 2772},
-	},
-		func() uint64 { return math.MaxUint64 },
-	)
-	require.NoError(t, err)
 
 	samples := dynparquet.NewTestSamples()
 	r, err := samples.ToRecord()
+	require.NoError(t, err)
+
+	// The cascade is driven entirely by the parquet-serialized size of the
+	// compacted data, an encoding detail that drifts across parquet-go
+	// versions, so measure the two sizes it hinges on at runtime rather than
+	// hardcoding bytes (compaction fires at size >= MaxSize):
+	//   - oneRecord: one record compacted into a single L1 file.
+	//   - merged:    two records compacted together into one file (measured one
+	//                level down). It exceeds oneRecord only by the second
+	//                record's row data on top of the fixed per-file overhead.
+	// L0's limit of 1 makes every Add compact into L1. The L1-probe's huge
+	// lower levels keep one record at L1; the merged-probe's L1 limit of
+	// oneRecord+1 keeps one record at L1 but forces the second Add's two L1
+	// parts to compact (and merge) down to L2.
+	huge := int64(math.MaxInt64)
+	mkLevels := func(l1 int64) []*LevelConfig {
+		return []*LevelConfig{
+			{Level: L0, MaxSize: 1, Type: CompactionTypeParquetMemory, Compact: compactParts},
+			{Level: L1, MaxSize: l1, Type: CompactionTypeParquetMemory, Compact: compactParts},
+			{Level: L2, MaxSize: huge, Type: CompactionTypeParquetMemory, Compact: compactParts},
+			{Level: 3, MaxSize: huge, Type: CompactionTypeParquetMemory, Compact: compactParts},
+			{Level: 4, MaxSize: huge},
+		}
+	}
+	oneRecord := probeSettledLevelSize(t, r, 1, L1, mkLevels(huge))
+	merged := probeSettledLevelSize(t, r, 2, L2, mkLevels(oneRecord+1))
+	require.Greater(t, merged, oneRecord,
+		"two records must serialize larger than one for the cascade to have a separating threshold")
+
+	// Any limit in (oneRecord, merged] separates the two: with the >= trigger a
+	// single oneRecord-byte file STAYS at L1, while the larger merged file (and
+	// the two-part L1 that produces it) CASCADES on through every level to the
+	// terminal one. Sizes are exact integers, so oneRecord+1 is sufficient and
+	// exact, robust to any gap of at least one byte.
+	limit := oneRecord + 1
+	lsm, err := NewLSM("test", nil, []*LevelConfig{
+		{Level: L0, MaxSize: 1, Type: CompactionTypeParquetMemory, Compact: compactParts},
+		{Level: L1, MaxSize: limit, Type: CompactionTypeParquetMemory, Compact: compactParts},
+		{Level: L2, MaxSize: limit, Type: CompactionTypeParquetMemory, Compact: compactParts},
+		{Level: 3, MaxSize: limit, Type: CompactionTypeParquetMemory, Compact: compactParts},
+		{Level: 4, MaxSize: limit},
+	},
+		func() uint64 { return math.MaxUint64 },
+	)
 	require.NoError(t, err)
 
 	lsm.Add(1, r)
