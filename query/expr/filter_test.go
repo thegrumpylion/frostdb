@@ -207,3 +207,43 @@ func TestMaxAgg(t *testing.T) {
 		})
 	}
 }
+
+// TestMaxAggForeignParquetMissingNullCounts pins the fix for a panic on
+// foreign-written parquet. The column-index null_counts field is OPTIONAL in
+// the format, and parquet-go reports NullCount==0 when it is absent. For an
+// all-null chunk written that way, MaxAgg's NullCount==NumValues all-null guard
+// does not fire, Max(index) returns a null Value, and passing it to compare()
+// as the first argument panicked ("unsupported value comparison"). The all-null
+// chunk must be skipped instead.
+func TestMaxAggForeignParquetMissingNullCounts(t *testing.T) {
+	// One single-Int64-column particulate with an explicit (max, nullCount).
+	mk := func(max parquet.Value, nullCount int64) fakeParticulate {
+		s := parquet.NewSchema("", parquet.Group{"a": parquet.Int(64)})
+		return fakeParticulate{
+			schema: s,
+			columnChunks: []parquet.ColumnChunk{
+				&FakeColumnChunk{
+					index:     &FakeColumnIndex{numPages: 1, min: parquet.Value{}, max: max, nullCount: nullCount},
+					numValues: 1,
+				},
+			},
+		}
+	}
+
+	agg := &MaxAgg{columnName: "a"}
+
+	// A real chunk sets the running max.
+	got, err := agg.Eval(mk(parquet.ValueOf(int64(3)), 0), false)
+	require.NoError(t, err)
+	require.True(t, got)
+
+	// Foreign all-null chunk: max is null but null_counts are absent
+	// (nullCount==0 != numValues), so the all-null guard misses it. Pre-fix this
+	// reached compare(null, 3) and panicked; it must now be skipped (contributes
+	// no max, so the filter does not pass).
+	require.NotPanics(t, func() {
+		got, err = agg.Eval(mk(parquet.ValueOf(nil), 0), false)
+	})
+	require.NoError(t, err)
+	require.False(t, got)
+}

@@ -186,6 +186,17 @@ func (a *MaxAgg) Eval(p Particulate, _ bool) (bool, error) {
 		atomicMax := columnPointer.(*atomic.Pointer[parquet.Value])
 
 		v := Max(index)
+		if v.IsNull() {
+			// Max(index) is null only for an all-null chunk (no page has a
+			// non-null max). The NullCount==NumValues guard above is meant to
+			// skip those, but parquet makes column-index null_counts OPTIONAL:
+			// a foreign writer that omits them makes NullCount report 0, so the
+			// guard misses an all-null chunk. A null bound must not reach the
+			// max logic -- compare() panics on a null first argument, and
+			// memoizing null as the running max would corrupt it. Skip it, as
+			// the BinaryScalarOperation min/max cases skip a null bound.
+			continue
+		}
 		for globalMax := atomicMax.Load(); globalMax == nil || compare(v, *globalMax) > 0; globalMax = atomicMax.Load() {
 			if atomicMax.CompareAndSwap(globalMax, &v) {
 				// At least one column exceeded the current max so this chunk
